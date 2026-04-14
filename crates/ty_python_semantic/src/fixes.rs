@@ -9,7 +9,7 @@ use ruff_db::{
     files::File,
     source::source_text,
 };
-use ruff_diagnostics::{Edit, Fix, IsolationLevel, SourceMap};
+use ruff_diagnostics::{Applicability, Edit, Fix, IsolationLevel, SourceMap};
 use ruff_text_size::{Ranged, TextLen, TextRange, TextSize};
 use rustc_hash::{FxHashMap, FxHashSet};
 use salsa::Setter as _;
@@ -58,12 +58,13 @@ pub fn suppress_all_diagnostics(
 pub fn fix_all_diagnostics(
     db: &mut dyn Db,
     diagnostics: Vec<Diagnostic>,
+    applicability: Applicability,
     cancellation_token: &CancellationToken,
 ) -> Result<FixAllResults, Canceled> {
     fix_all(
         db,
         diagnostics,
-        FixMode::ApplyFixes,
+        FixMode::ApplyFixes(applicability),
         cancellation_token,
         Db::check_file,
     )
@@ -202,11 +203,12 @@ where
                     }
 
                     if is_last_iteration {
-                        file.push_diagnostic(create_too_many_iterations_diagnostics(
+                        let diagnostic = create_too_many_iterations_diagnostics(
                             file.file,
                             fix_mode,
-                            &diagnostics,
-                        ));
+                            file.diagnostics(),
+                        );
+                        file.push_diagnostic(diagnostic);
                         completed.push(file.into_fixed());
                         continue;
                     }
@@ -346,6 +348,7 @@ fn create_too_many_iterations_diagnostics(
 
     diag.add_bug_sub_diagnostics("%5BInfinite%20loop%5D");
     diag.info(format_args!("Fixable diagnostics: {codes}"));
+
     diag
 }
 
@@ -353,8 +356,8 @@ fn create_too_many_iterations_diagnostics(
 enum FixMode {
     /// Adds suppression comments for every suppressable diagnostic.
     Suppress,
-    /// Applies the diagnostic's safe fixes.
-    ApplyFixes,
+    /// Applies the diagnostic's fixes that have at least the given applicability.
+    ApplyFixes(Applicability),
 }
 
 impl FixMode {
@@ -371,9 +374,7 @@ impl FixMode {
                         .as_lint()
                         .is_some_and(|name| !is_unused_ignore_comment_lint(name))
             }
-            FixMode::ApplyFixes => {
-                diagnostic.has_applicable_fix(ruff_diagnostics::Applicability::Safe)
-            }
+            FixMode::ApplyFixes(applicability) => diagnostic.has_applicable_fix(applicability),
         }
     }
 
@@ -411,11 +412,9 @@ impl FixMode {
                     )
                     .collect()
             }
-            FixMode::ApplyFixes => file_diagnostics
+            FixMode::ApplyFixes(applicability) => file_diagnostics
                 .iter()
-                .filter(|diagnostic| {
-                    diagnostic.has_applicable_fix(ruff_diagnostics::Applicability::Safe)
-                })
+                .filter(|diagnostic| diagnostic.has_applicable_fix(applicability))
                 .filter_map(|diagnostic| {
                     diagnostic.fix().cloned().map(|fix| ApplicableFix {
                         fix,
@@ -676,6 +675,13 @@ impl<'a> QueuedFile<'a> {
         }
     }
 
+    fn diagnostics(&self) -> &[Diagnostic] {
+        match &self.diagnostics {
+            None => self.original_diagnostics,
+            Some(diagnostics) => diagnostics,
+        }
+    }
+
     fn push_diagnostic(&mut self, diagnostic: Diagnostic) {
         let diagnostics = self
             .diagnostics
@@ -784,8 +790,8 @@ mod tests {
     use ruff_db::parsed::parsed_module;
     use ruff_db::source::source_text;
     use ruff_db::system::SystemPath;
-    use ruff_diagnostics::{Edit, Fix};
-    use ruff_text_size::{TextRange, TextSize};
+    use ruff_diagnostics::{Applicability, Edit, Fix};
+    use ruff_text_size::{TextLen as _, TextRange, TextSize};
     use rustc_hash::FxHashMap;
 
     use super::suppress_all_diagnostics;
@@ -1035,20 +1041,21 @@ class B(A):
     /// if the fixes never converge and that it emits a diagnostic in that case.
     #[test]
     fn fix_non_convergence() {
+        const LINT_ID: DiagnosticId = DiagnosticId::lint("unsatisfiable-lint");
+
         let mut db = TestDbBuilder::new()
             .with_file("test.py", "a = 10")
             .build()
             .unwrap();
 
         let file = system_path_to_file(&db, "test.py").unwrap();
-        const LINT_ID: DiagnosticId = DiagnosticId::lint("unsatisfiable-lint");
 
         // For this test, we intentionally keep renaming a variable form `a` -> `b` and
         // from `b` -> `a`. This ensures that the fix never converges.
         let check_file = |db: &dyn Db, file: File| {
             let text = source_text(db, file);
 
-            let message = if text.contains("a") {
+            let message = if text.contains('a') {
                 "Variable `a` should be named `b`."
             } else {
                 "Variable `b` should be named `a`."
@@ -1062,7 +1069,7 @@ class B(A):
                 Span::from(file).with_range(variable_range),
             ));
 
-            let new_name = if text.contains("a") { "b" } else { "a" };
+            let new_name = if text.contains('a') { "b" } else { "a" };
 
             diag.set_fix(Fix::safe_edit(Edit::range_replacement(
                 new_name.to_string(),
@@ -1078,7 +1085,7 @@ class B(A):
         let fixes = fix_all(
             &mut db,
             initial_diagnostics,
-            FixMode::ApplyFixes,
+            FixMode::ApplyFixes(Applicability::Safe),
             &cancellation_token_source.token(),
             check_file,
         )
@@ -1109,20 +1116,21 @@ class B(A):
     /// Tests that `fix_all` reverts fixes that introduce a syntax error.
     #[test]
     fn fix_syntax_error() {
+        const LINT_ID: DiagnosticId = DiagnosticId::lint("with-faulty-fix");
+
         let mut db = TestDbBuilder::new()
             .with_file("test.py", "a = 10")
             .build()
             .unwrap();
 
         let file = system_path_to_file(&db, "test.py").unwrap();
-        const LINT_ID: DiagnosticId = DiagnosticId::lint("with-faulty-fix");
 
         // For this test, we intentionally keep renaming a variable form `a` -> `b` and
         // from `b` -> `a`. This ensures that the fix never converges.
         let check_file = |db: &dyn Db, file: File| {
             let text = source_text(db, file);
 
-            let message = if text.contains("a") {
+            let message = if text.contains('a') {
                 "Variable `a` should be named `b`."
             } else {
                 "Variable `b` should be named `c`."
@@ -1136,7 +1144,7 @@ class B(A):
                 Span::from(file).with_range(variable_range),
             ));
 
-            let edit = if text.contains("a") {
+            let edit = if text.contains('a') {
                 Edit::range_replacement("b".to_string(), variable_range)
             } else {
                 // Insert an extra `=`, resulting in a syntax error
@@ -1154,7 +1162,7 @@ class B(A):
         let fixes = fix_all(
             &mut db,
             initial_diagnostics,
-            FixMode::ApplyFixes,
+            FixMode::ApplyFixes(Applicability::Safe),
             &cancellation_token_source.token(),
             check_file,
         )
@@ -1184,13 +1192,14 @@ class B(A):
 
     #[test]
     fn fix_cancellation_reverts_changes() {
+        const LINT_ID: DiagnosticId = DiagnosticId::lint("rename-a-to-b");
+
         let mut db = TestDbBuilder::new()
             .with_file("test.py", "a = 10")
             .build()
             .unwrap();
 
         let file = system_path_to_file(&db, "test.py").unwrap();
-        const LINT_ID: DiagnosticId = DiagnosticId::lint("rename-a-to-b");
 
         let cancellation_token_source = CancellationTokenSource::new();
 
@@ -1226,7 +1235,7 @@ class B(A):
         let result = fix_all(
             &mut db,
             initial_diagnostics,
-            FixMode::ApplyFixes,
+            FixMode::ApplyFixes(Applicability::Safe),
             &cancellation_token_source.token(),
             check_file,
         );
@@ -1260,11 +1269,12 @@ class B(A):
             let text = source_text(db, file);
 
             let range_of = |needle: &str| {
-                let start = text.find(needle).unwrap_or_else(|| {
+                let start = TextSize::try_from(text.find(needle).unwrap_or_else(|| {
                     panic!("Expected `{needle}` in source:\n{}", text.as_str());
-                }) as u32;
-                let end = start + needle.len() as u32;
-                TextRange::new(TextSize::new(start), TextSize::new(end))
+                }))
+                .unwrap();
+                let end = start + needle.text_len();
+                TextRange::new(start, end)
             };
 
             let use_builtin_list_diagnostic = |file: File| {
@@ -1327,7 +1337,7 @@ class B(A):
         let fixes = fix_all(
             &mut db,
             initial_diagnostics,
-            FixMode::ApplyFixes,
+            FixMode::ApplyFixes(Applicability::Safe),
             &cancellation_token_source.token(),
             check_file,
         )

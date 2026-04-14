@@ -35,10 +35,10 @@ use ruff_db::{
     diagnostic::{Annotation, Diagnostic, Span, SubDiagnostic, SubDiagnosticSeverity},
     parsed::parsed_module,
 };
-use ruff_diagnostics::{Edit, Fix};
+use ruff_diagnostics::{Edit, Fix, IsolationLevel};
 use ruff_python_ast::name::Name;
 use ruff_python_ast::token::parentheses_iterator;
-use ruff_python_ast::{self as ast, AnyNodeRef, PythonVersion, StringFlags};
+use ruff_python_ast::{self as ast, AnyNodeRef, HasNodeIndex, PythonVersion, StringFlags};
 use ruff_text_size::{Ranged, TextRange};
 use rustc_hash::FxHashSet;
 use std::fmt::{self, Formatter};
@@ -5099,6 +5099,28 @@ pub(crate) fn report_invalid_key_on_typed_dict<'db>(
     key_ty: Type<'db>,
     items: &TypedDictSchema<'db>,
 ) {
+    fn key_is_defined_in_any_typed_dict_branch<'db>(
+        db: &'db dyn Db,
+        object_ty: Type<'db>,
+        key: &str,
+    ) -> bool {
+        if let Some(typed_dict) = object_ty.as_typed_dict() {
+            return typed_dict.items(db).contains_key(key);
+        }
+
+        match object_ty {
+            Type::Union(union) => union
+                .elements(db)
+                .iter()
+                .any(|element| key_is_defined_in_any_typed_dict_branch(db, *element, key)),
+            Type::Intersection(intersection) => intersection
+                .positive(db)
+                .iter()
+                .any(|element| key_is_defined_in_any_typed_dict_branch(db, *element, key)),
+            _ => false,
+        }
+    }
+
     let db = context.db();
     if let Some(builder) = context.report_lint(&INVALID_KEY, key_node) {
         match key_ty.as_string_literal() {
@@ -5127,7 +5149,11 @@ pub(crate) fn report_invalid_key_on_typed_dict<'db>(
                 });
 
                 let existing_keys = items.keys().map(Name::as_str);
-                if let Some(suggestion) = did_you_mean(existing_keys, key) {
+                let suggestion_target = full_object_ty.unwrap_or(typed_dict_ty);
+
+                if let Some(suggestion) = did_you_mean(existing_keys, key)
+                    && !key_is_defined_in_any_typed_dict_branch(db, suggestion_target, key)
+                {
                     if let AnyNodeRef::ExprStringLiteral(literal) = key_node {
                         let quoted_suggestion = format!(
                             "{quote}{suggestion}{quote}",
@@ -5832,6 +5858,14 @@ pub(super) fn report_overridden_final_method<'db>(
                     .contains(overload.node(db, context.file(), context.module()))
             });
 
+        let isolate = IsolationLevel::Group(
+            class_node
+                .node_index()
+                .load()
+                .as_u32()
+                .expect("`parsed_module` should have assigned a node index"),
+        );
+
         match function.overloads_and_implementation(db) {
             ([first_overload, rest @ ..], None) => {
                 diagnostic.help(format_args!("Remove all overloads for `{member}`"));
@@ -5840,6 +5874,7 @@ pub(super) fn report_overridden_final_method<'db>(
                         overload_deletion(first_overload),
                         rest.iter().map(overload_deletion),
                     )
+                    .isolate(isolate)
                 }));
             }
             ([first_overload, rest @ ..], Some(implementation)) => {
@@ -5851,13 +5886,14 @@ pub(super) fn report_overridden_final_method<'db>(
                         overload_deletion(first_overload),
                         rest.iter().chain([&implementation]).map(overload_deletion),
                     )
+                    .isolate(isolate)
                 }));
             }
             ([], Some(implementation)) => {
                 diagnostic.help(format_args!("Remove the override of `{member}`"));
-                diagnostic.set_optional_fix(
-                    should_fix.then(|| Fix::unsafe_edit(overload_deletion(&implementation))),
-                );
+                diagnostic.set_optional_fix(should_fix.then(|| {
+                    Fix::unsafe_edit(overload_deletion(&implementation)).isolate(isolate)
+                }));
             }
             ([], None) => {
                 // Should be impossible to get here: how would we even infer a function as a function
